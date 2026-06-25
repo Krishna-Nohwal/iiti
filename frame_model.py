@@ -126,7 +126,7 @@ class ViT(nn.Module):
 
         logits_list:   list = []
         features_list: list = []
-        cls_list : list = []
+        cls_list:      list = []
 
         for i, (spatial_map, prefix_tokens) in enumerate(intermediates):
             B, C, H, W = spatial_map.shape
@@ -136,7 +136,7 @@ class ViT(nn.Module):
 
             result = self.mac_heads[i](cls_tok, reg_tok, patch_tok)
             logits_list.append(result["logits"])
-            features_list.append(result["feats"])
-            cls_list : list = [] 
+            features_list.append(result["features"])
+            cls_list.append(result["f_cls"])
 
         return logits_list, features_list, cls_list
