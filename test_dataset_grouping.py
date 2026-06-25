@@ -4,6 +4,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import torch
+from torch.utils.data import Sampler
 
 
 def extract_video_id(sample_dir: str) -> str:
@@ -33,6 +35,24 @@ def sample_frames(paths, num_frames):
     else:
         indices = np.arange(n)
     return [paths[i] for i in indices]
+
+
+class BalancedRealFakeBatchSampler(Sampler):
+    def __init__(self, labels):
+        self.real_indices = [i for i, label in enumerate(labels) if label == 0]
+        self.fake_indices = [i for i, label in enumerate(labels) if label == 1]
+        if not self.real_indices or not self.fake_indices:
+            raise ValueError("Need at least one real and one fake item.")
+        self.num_batches = min(len(self.real_indices), len(self.fake_indices))
+
+    def __iter__(self):
+        real_perm = torch.randperm(len(self.real_indices)).tolist()
+        fake_perm = torch.randperm(len(self.fake_indices)).tolist()
+        for i in range(self.num_batches):
+            yield [self.real_indices[real_perm[i]], self.fake_indices[fake_perm[i]]]
+
+    def __len__(self):
+        return self.num_batches
 
 
 def expected_label_from_dir(sample_dir, flip_labels):
@@ -89,6 +109,13 @@ def main():
             selected_examples.append((video_id, labels[0], paths, sample_frames(paths, args.num_frames)))
 
     frame_count_hist = Counter(video_frame_counts.values())
+    video_labels = [int(group["label"].iloc[0]) for _, group in df.groupby("video_id", sort=True)]
+    batch_sampler = BalancedRealFakeBatchSampler(video_labels)
+    checked_batches = []
+    for batch in batch_sampler:
+        checked_batches.append([video_labels[i] for i in batch])
+        if len(checked_batches) >= 5:
+            break
 
     print(f"manifest: {args.manifest}")
     print(f"root_dir: {root}")
@@ -100,6 +127,8 @@ def main():
     print(f"missing image.png files: {len(missing)}")
     print(f"label/directory mismatches: {len(label_mismatches)}")
     print(f"mixed-label videos: {len(mixed_label_videos)}")
+    print(f"balanced train batches/epoch: {len(batch_sampler)}")
+    print(f"first balanced batch labels: {checked_batches}")
 
     for video_id, label, paths, selected in selected_examples:
         print()
@@ -117,6 +146,7 @@ def main():
     assert not missing, "Some manifest rows do not have image.png on disk."
     assert len(label_mismatches) == 0, "Some labels do not match their top-level directory."
     assert len(mixed_label_videos) == 0, "Some grouped videos contain multiple labels."
+    assert all(sorted(labels) == [0, 1] for labels in checked_batches), "Balanced sampler made an invalid batch."
     for _, group in df.groupby("video_id"):
         paths = sorted(group["sample_dir"].tolist())
         selected = sample_frames(paths, args.num_frames)

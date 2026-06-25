@@ -4,7 +4,7 @@ import pandas as pd
 from tqdm import tqdm
 from pathlib import Path
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler
 import torch.nn.functional as F
 from torch import nn
 from augmentations import augment_batch, load_and_resize, normalize
@@ -272,6 +272,26 @@ class ManifestVideoDataset(Dataset):
         return frames, label
 
 
+class BalancedRealFakeBatchSampler(Sampler):
+    """Yield training batches containing one real video and one fake video."""
+
+    def __init__(self, dataset: ManifestVideoDataset):
+        self.real_indices = [i for i, (_, label) in enumerate(dataset.videos) if label == 0]
+        self.fake_indices = [i for i, (_, label) in enumerate(dataset.videos) if label == 1]
+        if not self.real_indices or not self.fake_indices:
+            raise ValueError("Balanced batches need at least one real and one fake video.")
+        self.num_batches = min(len(self.real_indices), len(self.fake_indices))
+
+    def __iter__(self):
+        real_perm = torch.randperm(len(self.real_indices)).tolist()
+        fake_perm = torch.randperm(len(self.fake_indices)).tolist()
+        for i in range(self.num_batches):
+            yield [self.real_indices[real_perm[i]], self.fake_indices[fake_perm[i]]]
+
+    def __len__(self):
+        return self.num_batches
+
+
 class CDFv1VideoDataset(Dataset):
     """
     CDFv1 test dataset (video-level).
@@ -408,10 +428,13 @@ if __name__ == "__main__":
 
     _persistent = _num_workers > 0
     _prefetch   = 4 if _num_workers > 0 else None
+    train_batch_sampler = BalancedRealFakeBatchSampler(train_dataset)
+    print(f"Train balanced batches -> {len(train_batch_sampler)} batches/epoch "
+          f"(1 real + 1 fake video per batch)")
 
     train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, num_workers=_num_workers,
-        pin_memory=True, shuffle=True,
+        train_dataset, batch_sampler=train_batch_sampler, num_workers=_num_workers,
+        pin_memory=True,
         collate_fn=video_collate_fn,
         persistent_workers=_persistent, prefetch_factor=_prefetch,
     )
