@@ -38,7 +38,8 @@ parser.add_argument('--root_dir',      default='E:/Work/sampled_30k/', type=str)
 parser.add_argument('--cdf_root',      default='E:/Work/cdfv1_onct_out', type=str)
 parser.add_argument('--cdf_csv',       default='E:/Work/cdfv1_onct_out/manifest_cdfv1_onct.csv', type=str)
 parser.add_argument('--val_ratio',     default=0.05, type=float)
-parser.add_argument('--frame_loss_weight', default=1.0, type=float)
+parser.add_argument('--frame_loss_weight', default=2.0, type=float,
+                    help='Weight for frame-level CE. Total loss = video CE + weight * frame CE.')
 parser.add_argument('--no_compile',    action='store_true',
                     help='Disable torch.compile (useful for debugging)')
 args = parser.parse_args()
@@ -273,20 +274,20 @@ class ManifestVideoDataset(Dataset):
 
 
 class BalancedRealFakeBatchSampler(Sampler):
-    """Yield training batches containing one real video and one fake video."""
+    """Yield one real and one fake per batch, oversampling reals if needed."""
 
     def __init__(self, dataset: ManifestVideoDataset):
         self.real_indices = [i for i, (_, label) in enumerate(dataset.videos) if label == 0]
         self.fake_indices = [i for i, (_, label) in enumerate(dataset.videos) if label == 1]
         if not self.real_indices or not self.fake_indices:
             raise ValueError("Balanced batches need at least one real and one fake video.")
-        self.num_batches = min(len(self.real_indices), len(self.fake_indices))
+        self.num_batches = max(len(self.real_indices), len(self.fake_indices))
 
     def __iter__(self):
-        real_perm = torch.randperm(len(self.real_indices)).tolist()
-        fake_perm = torch.randperm(len(self.fake_indices)).tolist()
+        real_perm = [self.real_indices[i] for i in torch.randint(len(self.real_indices), (self.num_batches,)).tolist()]
+        fake_perm = [self.fake_indices[i] for i in torch.randint(len(self.fake_indices), (self.num_batches,)).tolist()]
         for i in range(self.num_batches):
-            yield [self.real_indices[real_perm[i]], self.fake_indices[fake_perm[i]]]
+            yield [real_perm[i], fake_perm[i]]
 
     def __len__(self):
         return self.num_batches
@@ -430,7 +431,7 @@ if __name__ == "__main__":
     _prefetch   = 4 if _num_workers > 0 else None
     train_batch_sampler = BalancedRealFakeBatchSampler(train_dataset)
     print(f"Train balanced batches -> {len(train_batch_sampler)} batches/epoch "
-          f"(1 real + 1 fake video per batch)")
+          f"(1 real + 1 fake video per batch; minority class oversampled)")
 
     train_loader = DataLoader(
         train_dataset, batch_sampler=train_batch_sampler, num_workers=_num_workers,
