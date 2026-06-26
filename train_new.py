@@ -454,27 +454,38 @@ def video_frame_loss(video_logits, frame_logits_list, frame_feats_list,
         for i in range(4)
     )
 
-    total = l_video + frame_weight * (l_bce_last + l_bce_early + l_supcon)
-    return total / n_valid
+    total = (l_video/n_valid) + frame_weight * (l_bce_last + l_bce_early + l_supcon)
+    return total 
 
 
 def frame_and_video_predictions(video_logits, frame_logits_list, labels, lengths):
     B = labels.size(0)
     T = frame_logits_list[0].size(0) // B
     frame_labels = labels.repeat_interleave(T)
-    mean_frame_logits = torch.stack(frame_logits_list, dim=0).mean(dim=0)
 
     time_idx = torch.arange(T, device=labels.device).unsqueeze(0)
     valid_by_video = time_idx < lengths.to(labels.device).unsqueeze(1)
     valid_mask = valid_by_video.reshape(-1)
 
-    frame_probs_all = torch.softmax(mean_frame_logits.float(), dim=1)[:, 1].reshape(B, T)
-    frame_probs = frame_probs_all.reshape(-1)[valid_mask]
+    # MACHead contribution: average of 4 layers
+    mean_frame_logits = torch.stack(frame_logits_list, dim=0).mean(dim=0)
+    mac_probs = torch.softmax(mean_frame_logits.float(), dim=1)[:, 1]  # (B*T,)
 
+    # Video logit contribution: broadcast each video's prob to its T frames
+    video_probs_per_frame = torch.softmax(video_logits.float(), dim=1)[:, 1]  # (B,)
+    video_probs_per_frame = video_probs_per_frame.repeat_interleave(T)         # (B*T,)
+
+    # Frame prob = weighted average (MACHead 5x stronger than video logit)
+    frame_probs_all = (5 * mac_probs + video_probs_per_frame) / 6  # (B*T,)
+    frame_probs = frame_probs_all[valid_mask]
+
+    # Video prob = mean of its valid frame probs
+    frame_probs_2d = frame_probs_all.reshape(B, T)
     video_probs = (
-        (frame_probs_all * valid_by_video.float()).sum(dim=1)
+        (frame_probs_2d * valid_by_video.float()).sum(dim=1)
         / lengths.to(labels.device).clamp_min(1).float()
     )
+
     return frame_labels[valid_mask], frame_probs, labels, video_probs
 
 
