@@ -39,8 +39,8 @@ parser.add_argument('--root_dir',      default='E:/Work/sampled_30k/', type=str)
 parser.add_argument('--cdf_root',      default='E:/Work/cdfv1_onct_out', type=str)
 parser.add_argument('--cdf_csv',       default='E:/Work/cdfv1_onct_out/manifest_cdfv1_onct.csv', type=str)
 parser.add_argument('--val_ratio',     default=0.2, type=float)
-parser.add_argument('--frame_loss_weight', default=3.0, type=float,
-                    help='Weight for frame-level CE+SupCon. Total loss is averaged per valid frame.')
+parser.add_argument('--frame_loss_weight', default=1.0, type=float,
+                    help='Weight for frame-level CE+SupCon terms.')
 parser.add_argument('--supcon_weight', default=1/16, type=float)
 parser.add_argument('--no_compile',    action='store_true',
                     help='Disable torch.compile (useful for debugging)')
@@ -372,8 +372,9 @@ class CDFv1VideoDataset(Dataset):
 # Loss
 # ---------------------------------------------------------------------------
 
-bce_loss = nn.CrossEntropyLoss()
-supcon_loss = SupConLoss()
+bce_loss     = nn.CrossEntropyLoss()               # mean reduction (kept for legacy)
+bce_loss_sum = nn.CrossEntropyLoss(reduction='sum') # sum reduction for per-frame loss
+supcon_loss  = SupConLoss()
 
 def _legacy_video_loss(video_logits, frame_logits_list, labels, lengths, frame_weight=1.0):
     """
@@ -406,28 +407,55 @@ def _legacy_video_loss(video_logits, frame_logits_list, labels, lengths, frame_w
     return l_video + frame_weight * l_frame
 
 
-def frame_loss(logits, features, labels, lam):
-    return bce_loss(logits, labels) + lam * supcon_loss(features, labels)
-
-
 def video_frame_loss(video_logits, frame_logits_list, frame_feats_list,
                      labels, lengths, frame_weight=1.0, lam=1/16):
+    """
+    Per-frame loss, normalised by total valid frames in the batch.
+
+    For every valid frame f in video v, the per-frame loss is:
+        BCE(video_logits[v])                           <- video signal on every frame
+      + BCE(MACHead[layer_3][f])                       <- last layer, weight 1
+      + (1/3) * BCE(MACHead[layer_i][f]) i in [0,1,2] <- early layers, weight 1/3
+      + lam * SupCon(layer_i features)   i in [0,1,2,3]
+
+    All CE terms use reduction='sum'; the whole thing is divided by n_valid
+    at the end so the final scalar is a per-frame mean, keeping loss magnitude
+    stable across different batch sizes / video lengths.
+
+    SupConLoss from pytorch_metric_learning uses its own internal reduction;
+    it is added as-is and also divided by n_valid for consistency.
+
+    frame_logits_list / frame_feats_list: list of 4, index 3 = last layer (ViT layer 23).
+    """
     B = labels.size(0)
     T = frame_logits_list[0].size(0) // B
-    frame_labels = labels.repeat_interleave(T)
-    video_logits_per_frame = video_logits.repeat_interleave(T, dim=0)
+    frame_labels = labels.repeat_interleave(T)   # (B*T,)
 
-    time_idx = torch.arange(T, device=labels.device).unsqueeze(0)
-    valid_mask = time_idx < lengths.to(labels.device).unsqueeze(1)
-    valid_mask = valid_mask.reshape(-1)
+    time_idx   = torch.arange(T, device=labels.device).unsqueeze(0)
+    valid_mask = (time_idx < lengths.to(labels.device).unsqueeze(1)).reshape(-1)  # (B*T,)
+    n_valid    = valid_mask.sum().clamp_min(1)
 
-    l_video = bce_loss(video_logits_per_frame[valid_mask], frame_labels[valid_mask])
-    l_frame = sum(
-        frame_loss(fl[valid_mask], ff[valid_mask], frame_labels[valid_mask], lam)
-        for fl, ff in zip(frame_logits_list, frame_feats_list)
-    ) / len(frame_logits_list)
+    # -- Video loss broadcast to every valid frame ----------------------------
+    # repeat_interleave so video v's logit aligns with all T frames of v.
+    # bce_loss_sum gives one contribution per frame -> sums to T * video_BCE per video.
+    video_logits_per_frame = video_logits.repeat_interleave(T, dim=0)  # (B*T, 2)
+    l_video = bce_loss_sum(video_logits_per_frame[valid_mask], frame_labels[valid_mask])
 
-    return l_video + frame_weight * l_frame
+    # -- Frame-level BCE (sum reduction) -------------------------------------
+    l_bce_last  = bce_loss_sum(frame_logits_list[3][valid_mask], frame_labels[valid_mask])
+    l_bce_early = (1/3) * sum(
+        bce_loss_sum(frame_logits_list[i][valid_mask], frame_labels[valid_mask])
+        for i in range(3)
+    )
+
+    # -- SupCon on all 4 layers independently --------------------------------
+    l_supcon = lam * sum(
+        supcon_loss(frame_feats_list[i][valid_mask], frame_labels[valid_mask])
+        for i in range(4)
+    )
+
+    total = l_video + frame_weight * (l_bce_last + l_bce_early + l_supcon)
+    return total / n_valid
 
 
 def frame_and_video_predictions(video_logits, frame_logits_list, labels, lengths):
