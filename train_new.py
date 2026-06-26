@@ -22,10 +22,10 @@ from video_model_small import VideoViT
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--epochs',        default=50,   type=int)
-parser.add_argument('--batch_size',    default=4,    type=int,
+parser.add_argument('--batch_size',    default=6,    type=int,
                     help='Videos per batch. Training batches are class-balanced, '
                          'so this must be an even number.')
-parser.add_argument('--num_frames',    default=32,   type=int,
+parser.add_argument('--num_frames',    default=12,   type=int,
                     help='Frames to sample per video. Must match VideoViT.num_frames.')
 parser.add_argument('--num_workers',   default=6,    type=int,
                     help='6 workers suits Ryzen 7000; tune down if RAM is tight')
@@ -430,6 +430,26 @@ def video_frame_loss(video_logits, frame_logits_list, frame_feats_list,
     return l_video + frame_weight * l_frame
 
 
+def frame_and_video_predictions(video_logits, frame_logits_list, labels, lengths):
+    B = labels.size(0)
+    T = frame_logits_list[0].size(0) // B
+    frame_labels = labels.repeat_interleave(T)
+    mean_frame_logits = torch.stack(frame_logits_list, dim=0).mean(dim=0)
+
+    time_idx = torch.arange(T, device=labels.device).unsqueeze(0)
+    valid_by_video = time_idx < lengths.to(labels.device).unsqueeze(1)
+    valid_mask = valid_by_video.reshape(-1)
+
+    frame_probs_all = torch.softmax(mean_frame_logits.float(), dim=1)[:, 1].reshape(B, T)
+    frame_probs = frame_probs_all.reshape(-1)[valid_mask]
+
+    video_probs = (
+        (frame_probs_all * valid_by_video.float()).sum(dim=1)
+        / lengths.to(labels.device).clamp_min(1).float()
+    )
+    return frame_labels[valid_mask], frame_probs, labels, video_probs
+
+
 # ---------------------------------------------------------------------------
 # Eval
 # ---------------------------------------------------------------------------
@@ -440,18 +460,26 @@ def run_eval(model, loader, desc, device):
     counter, saving a few microseconds per tensor op.
     autocast gives FP16 throughput during eval too.
     """
-    all_labels, all_probs = [], []
+    frame_labels_all, frame_probs_all = [], []
+    video_labels_all, video_probs_all = [], []
     model.eval()
     with torch.inference_mode(), torch.autocast(device_type=device.type, dtype=torch.float16):
         for frames, labels, lengths in tqdm(loader, desc=desc, leave=False):
             frames = frames.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
             lengths = lengths.to(device, non_blocking=True)
-            # VideoViT returns (video_logits, frame_logits, frame_feats, video_feats)
-            video_logits, _, _, _ = model(frames, lengths)
-            probs = torch.softmax(video_logits.float(), dim=1)[:, 1].cpu().numpy()
-            all_probs.extend(probs.tolist())
-            all_labels.extend(labels.numpy().tolist())
-    return all_labels, all_probs
+            video_logits, frame_logits_list, _, _ = model(frames, lengths)
+            frame_labels, frame_probs, video_labels, video_probs = frame_and_video_predictions(
+                video_logits,
+                frame_logits_list,
+                labels,
+                lengths,
+            )
+            frame_probs_all.extend(frame_probs.cpu().numpy().tolist())
+            frame_labels_all.extend(frame_labels.cpu().numpy().tolist())
+            video_probs_all.extend(video_probs.cpu().numpy().tolist())
+            video_labels_all.extend(video_labels.cpu().numpy().tolist())
+    return frame_labels_all, frame_probs_all, video_labels_all, video_probs_all
 
 
 # ---------------------------------------------------------------------------
@@ -554,7 +582,8 @@ if __name__ == "__main__":
 
         model.train()
         iter_i                    = epoch * iter_per_epoch
-        train_labels, train_probs = [], []
+        train_frame_labels, train_frame_probs = [], []
+        train_video_labels, train_video_probs = [], []
 
         for batch_idx, (frames, labels, lengths) in enumerate(
             tqdm(train_loader, desc=f"Epoch {epoch+1} [train]", leave=False)
@@ -586,22 +615,36 @@ if __name__ == "__main__":
             scheduler.step(iter_i + batch_idx)
 
             with torch.inference_mode():
-                probs = torch.softmax(video_logits.float(), dim=1)[:, 1].cpu().numpy()
-            train_probs.extend(probs.tolist())
-            train_labels.extend(labels.cpu().numpy().tolist())
+                frame_labels, frame_probs, video_labels, video_probs = frame_and_video_predictions(
+                    video_logits,
+                    frame_logits_list,
+                    labels,
+                    lengths,
+                )
+            train_frame_probs.extend(frame_probs.cpu().numpy().tolist())
+            train_frame_labels.extend(frame_labels.cpu().numpy().tolist())
+            train_video_probs.extend(video_probs.cpu().numpy().tolist())
+            train_video_labels.extend(video_labels.cpu().numpy().tolist())
 
             if batch_idx % 256 == 0:
                 print(f"  batch={batch_idx:4d}/{iter_per_epoch}  loss={loss.item():.4f}")
 
         # ── Metrics ─────────────────────────────────────────────────────────
         print()
-        compute_metrics(train_labels, train_probs, "Train", epoch)
+        compute_metrics(train_frame_labels, train_frame_probs, "Train frame", epoch)
+        compute_metrics(train_video_labels, train_video_probs, "Train video", epoch)
 
-        val_labels, val_probs = run_eval(model, val_loader, f"Epoch {epoch+1} [val]", device)
-        compute_metrics(val_labels, val_probs, "Val  ", epoch)
+        val_frame_labels, val_frame_probs, val_video_labels, val_video_probs = run_eval(
+            model, val_loader, f"Epoch {epoch+1} [val]", device
+        )
+        compute_metrics(val_frame_labels, val_frame_probs, "Val frame  ", epoch)
+        compute_metrics(val_video_labels, val_video_probs, "Val video  ", epoch)
 
-        cdf_labels, cdf_probs = run_eval(model, cdf_loader, f"Epoch {epoch+1} [CDFv1]", device)
-        test_auc = compute_metrics(cdf_labels, cdf_probs, "Test ", epoch)
+        cdf_frame_labels, cdf_frame_probs, cdf_video_labels, cdf_video_probs = run_eval(
+            model, cdf_loader, f"Epoch {epoch+1} [CDFv1]", device
+        )
+        compute_metrics(cdf_frame_labels, cdf_frame_probs, "Test frame ", epoch)
+        test_auc = compute_metrics(cdf_video_labels, cdf_video_probs, "Test video ", epoch)
 
         # ── Checkpointing ───────────────────────────────────────────────────
         state_dict = (model._orig_mod if hasattr(model, '_orig_mod') else model).state_dict()
