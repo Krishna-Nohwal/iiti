@@ -99,8 +99,8 @@ class ViT(nn.Module):
             drop_path_rate=self.DROP_PATH,
         )
         self.vit = get_peft_model(self.vit, LoraConfig(
-            r=64,
-            lora_alpha=128,        # 2× r
+            r=32,
+            lora_alpha=64,        # 2× r
             target_modules=["attn.qkv"],  # verify attr name: may be "qkv" depending on timm version
             lora_dropout=0.10,
             bias="none",

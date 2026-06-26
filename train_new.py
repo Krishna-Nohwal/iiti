@@ -6,13 +6,14 @@ from pathlib import Path
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, Sampler
 import torch.nn.functional as F
+from pytorch_metric_learning.losses import SupConLoss
 from torch import nn
 from augmentations import augment_batch, load_and_resize, normalize
 from sklearn.metrics import (
     roc_auc_score, roc_curve, average_precision_score,
     confusion_matrix, accuracy_score, f1_score,
 )
-from video_model import VideoViT
+from video_model_small import VideoViT
 
 
 # ---------------------------------------------------------------------------
@@ -21,9 +22,9 @@ from video_model import VideoViT
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--epochs',        default=50,   type=int)
-parser.add_argument('--batch_size',    default=2,    type=int,
-                    help='Videos per batch. Each video = num_frames images. '
-                         'Default 2 keeps VRAM under 6 GB on RTX 4050.')
+parser.add_argument('--batch_size',    default=4,    type=int,
+                    help='Videos per batch. Training batches are class-balanced, '
+                         'so this must be an even number.')
 parser.add_argument('--num_frames',    default=32,   type=int,
                     help='Frames to sample per video. Must match VideoViT.num_frames.')
 parser.add_argument('--num_workers',   default=6,    type=int,
@@ -37,9 +38,10 @@ parser.add_argument('--manifest',      default='E:/Work/sampled_30k/manifest_onc
 parser.add_argument('--root_dir',      default='E:/Work/sampled_30k/', type=str)
 parser.add_argument('--cdf_root',      default='E:/Work/cdfv1_onct_out', type=str)
 parser.add_argument('--cdf_csv',       default='E:/Work/cdfv1_onct_out/manifest_cdfv1_onct.csv', type=str)
-parser.add_argument('--val_ratio',     default=0.05, type=float)
-parser.add_argument('--frame_loss_weight', default=2.0, type=float,
-                    help='Weight for frame-level CE. Total loss = video CE + weight * frame CE.')
+parser.add_argument('--val_ratio',     default=0.2, type=float)
+parser.add_argument('--frame_loss_weight', default=3.0, type=float,
+                    help='Weight for frame-level CE+SupCon. Total loss is averaged per valid frame.')
+parser.add_argument('--supcon_weight', default=1/16, type=float)
 parser.add_argument('--no_compile',    action='store_true',
                     help='Disable torch.compile (useful for debugging)')
 args = parser.parse_args()
@@ -50,7 +52,7 @@ args = parser.parse_args()
 # ---------------------------------------------------------------------------
 
 save_root = args.save_root
-IMG_SIZE  = 266
+IMG_SIZE  = 256
 device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 _num_workers = args.num_workers
 
@@ -58,10 +60,6 @@ _num_workers = args.num_workers
 # Fixed input size (B×3×266×266) means the profile stays valid all run.
 torch.backends.cudnn.benchmark = True
 
-print(f"Using device: {device}")
-print(f"[DEBUG] Running file: {os.path.abspath(__file__)}")
-print(f"[DEBUG] Path.is_dir test: {(Path(args.root_dir) / "real" / "000_frame_03").is_dir()}")
-print(f"[DEBUG] image.png exists: {(Path(args.root_dir) / "real" / "000_frame_03" / "image.png").is_file()}")
 
 
 # ---------------------------------------------------------------------------
@@ -274,20 +272,39 @@ class ManifestVideoDataset(Dataset):
 
 
 class BalancedRealFakeBatchSampler(Sampler):
-    """Yield one real and one fake per batch, oversampling reals if needed."""
+    """Yield class-balanced batches, oversampling the minority class if needed."""
 
-    def __init__(self, dataset: ManifestVideoDataset):
+    def __init__(self, dataset: ManifestVideoDataset, batch_size: int):
+        if batch_size % 2 != 0:
+            raise ValueError("BalancedRealFakeBatchSampler requires an even batch_size.")
+        self.batch_size = batch_size
+        self.per_class = batch_size // 2
         self.real_indices = [i for i, (_, label) in enumerate(dataset.videos) if label == 0]
         self.fake_indices = [i for i, (_, label) in enumerate(dataset.videos) if label == 1]
         if not self.real_indices or not self.fake_indices:
             raise ValueError("Balanced batches need at least one real and one fake video.")
-        self.num_batches = max(len(self.real_indices), len(self.fake_indices))
+        self.num_batches = math.ceil(
+            max(len(self.real_indices), len(self.fake_indices)) / self.per_class
+        )
 
     def __iter__(self):
-        real_perm = [self.real_indices[i] for i in torch.randint(len(self.real_indices), (self.num_batches,)).tolist()]
-        fake_perm = [self.fake_indices[i] for i in torch.randint(len(self.fake_indices), (self.num_batches,)).tolist()]
+        n_per_class = self.num_batches * self.per_class
+        real_perm = self._sample_class(self.real_indices, n_per_class)
+        fake_perm = self._sample_class(self.fake_indices, n_per_class)
         for i in range(self.num_batches):
-            yield [real_perm[i], fake_perm[i]]
+            start = i * self.per_class
+            end = start + self.per_class
+            batch = real_perm[start:end] + fake_perm[start:end]
+            order = torch.randperm(len(batch)).tolist()
+            yield [batch[j] for j in order]
+
+    @staticmethod
+    def _sample_class(indices, n):
+        if len(indices) >= n:
+            return [indices[i] for i in torch.randperm(len(indices)).tolist()[:n]]
+        base = [indices[i] for i in torch.randperm(len(indices)).tolist()]
+        extra = [indices[i] for i in torch.randint(len(indices), (n - len(indices),)).tolist()]
+        return base + extra
 
     def __len__(self):
         return self.num_batches
@@ -356,8 +373,9 @@ class CDFv1VideoDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 bce_loss = nn.CrossEntropyLoss()
+supcon_loss = SupConLoss()
 
-def video_loss(video_logits, frame_logits_list, labels, lengths, frame_weight=1.0):
+def _legacy_video_loss(video_logits, frame_logits_list, labels, lengths, frame_weight=1.0):
     """
     Primary loss  : CE + SupCon on video-level logits/features.
     Auxiliary loss: mean CE across all 4 MACHead layers' frame logits.
@@ -383,6 +401,30 @@ def video_loss(video_logits, frame_logits_list, labels, lengths, frame_weight=1.
 
     l_frame = sum(
         bce_loss(fl[valid_mask], frame_labels[valid_mask]) for fl in frame_logits_list
+    ) / len(frame_logits_list)
+
+    return l_video + frame_weight * l_frame
+
+
+def frame_loss(logits, features, labels, lam):
+    return bce_loss(logits, labels) + lam * supcon_loss(features, labels)
+
+
+def video_frame_loss(video_logits, frame_logits_list, frame_feats_list,
+                     labels, lengths, frame_weight=1.0, lam=1/16):
+    B = labels.size(0)
+    T = frame_logits_list[0].size(0) // B
+    frame_labels = labels.repeat_interleave(T)
+    video_logits_per_frame = video_logits.repeat_interleave(T, dim=0)
+
+    time_idx = torch.arange(T, device=labels.device).unsqueeze(0)
+    valid_mask = time_idx < lengths.to(labels.device).unsqueeze(1)
+    valid_mask = valid_mask.reshape(-1)
+
+    l_video = bce_loss(video_logits_per_frame[valid_mask], frame_labels[valid_mask])
+    l_frame = sum(
+        frame_loss(fl[valid_mask], ff[valid_mask], frame_labels[valid_mask], lam)
+        for fl, ff in zip(frame_logits_list, frame_feats_list)
     ) / len(frame_logits_list)
 
     return l_video + frame_weight * l_frame
@@ -429,9 +471,10 @@ if __name__ == "__main__":
 
     _persistent = _num_workers > 0
     _prefetch   = 4 if _num_workers > 0 else None
-    train_batch_sampler = BalancedRealFakeBatchSampler(train_dataset)
+    train_batch_sampler = BalancedRealFakeBatchSampler(train_dataset, args.batch_size)
     print(f"Train balanced batches -> {len(train_batch_sampler)} batches/epoch "
-          f"(1 real + 1 fake video per batch; minority class oversampled)")
+          f"({args.batch_size // 2} real + {args.batch_size // 2} fake videos per batch; "
+          f"minority class oversampled)")
 
     train_loader = DataLoader(
         train_dataset, batch_sampler=train_batch_sampler, num_workers=_num_workers,
@@ -497,6 +540,7 @@ if __name__ == "__main__":
     )
 
     frame_loss_weight = args.frame_loss_weight
+    lam = args.supcon_weight
 
     # ── Training loop ───────────────────────────────────────────────────────
     best_test_auc = 0.0
@@ -522,13 +566,15 @@ if __name__ == "__main__":
             # Note: augmentation is already applied in the Dataset worker.
 
             with torch.autocast(device_type=device.type, dtype=torch.float16):
-                video_logits, frame_logits_list, _, _ = model(frames, lengths)
-                loss = video_loss(
+                video_logits, frame_logits_list, frame_feats_list, _ = model(frames, lengths)
+                loss = video_frame_loss(
                     video_logits,
                     frame_logits_list,
+                    frame_feats_list,
                     labels,
                     lengths,
                     frame_loss_weight,
+                    lam,
                 )
 
             optimizer.zero_grad(set_to_none=True)
