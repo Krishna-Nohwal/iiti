@@ -1,8 +1,130 @@
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 from typing import Optional
 
 from frame_model import ViT
+
+
+def temporal_augment(
+    frame_cls: Tensor,
+    key_padding_mask: Optional[Tensor],
+    blank_prob:   float = 0.15,
+    repeat_prob:  float = 0.10,
+    noise_std:    float = 0.02,
+    mixup_prob:   float = 0.10,
+    shuffle_prob: float = 0.05,
+    reverse_prob: float = 0.05,
+    speed_prob:   float = 0.10,
+) -> Tensor:
+    """
+    Temporal augmentation applied to CLS token sequences in embedding space,
+    after the frozen backbone and before the temporal transformers.
+
+    All augmentations operate on valid frames only (those not masked by
+    key_padding_mask). Padding slots are left as-is so the transformer's
+    padding mask remains consistent.
+
+    Args
+    ----
+    frame_cls        : (B, T, D)  CLS token sequence
+    key_padding_mask : (B, T) bool — True = padding, False = valid frame.
+                       None means all frames are valid.
+
+    Augmentations (applied independently per sample in the batch)
+    -------------------------------------------------------------
+    blank_prob   — replace a random valid frame with a zero vector
+                   (neutral in normalised embedding space)
+    repeat_prob  — duplicate a random valid frame into a random adjacent slot
+    noise_std    — add per-frame Gaussian noise scaled by the token's own norm,
+                   so the perturbation is proportional to the feature magnitude
+    mixup_prob   — interpolate two randomly chosen valid frames in-place
+    shuffle_prob — randomly permute the order of valid frames (low probability
+                   since real and fake videos are equally reversible; mainly
+                   acts as a regulariser against strict temporal order)
+    reverse_prob — reverse the temporal order of valid frames
+    speed_prob   — re-sample valid frames at a non-uniform stride, simulating
+                   variable frame rate (clusters some frames, spreads others)
+
+    Returns
+    -------
+    frame_cls : (B, T, D)  augmented in-place copy
+    """
+    B, T, D = frame_cls.shape
+    out = frame_cls.clone()
+
+    for b in range(B):
+        # Build list of valid frame indices for this sample.
+        if key_padding_mask is not None:
+            valid = (~key_padding_mask[b]).nonzero(as_tuple=True)[0]   # 1-D tensor
+        else:
+            valid = torch.arange(T, device=frame_cls.device)
+
+        n_valid = valid.numel()
+        if n_valid < 2:
+            continue   # nothing meaningful to augment with < 2 frames
+
+        # ── Blank frame ───────────────────────────────────────────────────
+        # Replace one valid frame with a zero vector.  Zeros are more neutral
+        # than black pixels would be after normalisation.
+        if torch.rand(1).item() < blank_prob:
+            idx = valid[torch.randint(n_valid, (1,)).item()]
+            out[b, idx] = 0.0
+
+        # ── Frame repetition ─────────────────────────────────────────────
+        # Pick a source frame and copy it into a randomly chosen neighbour slot.
+        if torch.rand(1).item() < repeat_prob and n_valid >= 2:
+            src_pos  = torch.randint(n_valid, (1,)).item()
+            src_idx  = valid[src_pos]
+            # Choose a neighbour that is different from the source.
+            offsets  = [-1, 1]
+            dst_pos  = (src_pos + offsets[torch.randint(2, (1,)).item()]) % n_valid
+            dst_idx  = valid[dst_pos]
+            out[b, dst_idx] = out[b, src_idx].clone()
+
+        # ── Embedding-space Gaussian noise ───────────────────────────────
+        # Scale noise by each frame token's own L2 norm so that strongly
+        # activating tokens receive proportionally larger perturbations.
+        if noise_std > 0:
+            tokens     = out[b, valid]                          # (n_valid, D)
+            norms      = tokens.norm(dim=-1, keepdim=True)     # (n_valid, 1)
+            noise      = torch.randn_like(tokens) * noise_std * norms
+            out[b, valid] = tokens + noise
+
+        # ── CLS token mixup ──────────────────────────────────────────────
+        # Interpolate two randomly chosen valid frames in embedding space.
+        # Destroys localised temporal cues without discarding information.
+        if torch.rand(1).item() < mixup_prob and n_valid >= 2:
+            perm   = torch.randperm(n_valid, device=frame_cls.device)
+            i1, i2 = valid[perm[0]], valid[perm[1]]
+            lam    = torch.rand(1, device=frame_cls.device).item()
+            mixed  = lam * out[b, i1] + (1 - lam) * out[b, i2]
+            out[b, i1] = mixed
+
+        # ── Temporal shuffle ─────────────────────────────────────────────
+        # Randomly permute valid frame order.  Low default probability because
+        # temporal order is only a weak cue for real/fake distinction.
+        if torch.rand(1).item() < shuffle_prob:
+            perm           = torch.randperm(n_valid, device=frame_cls.device)
+            out[b, valid]  = out[b, valid[perm]]
+
+        # ── Temporal reverse ─────────────────────────────────────────────
+        # Reverse the valid frame sequence.
+        if torch.rand(1).item() < reverse_prob:
+            out[b, valid] = out[b, valid.flip(0)]
+
+        # ── Speed perturbation ───────────────────────────────────────────
+        # Re-sample valid frames at a non-uniform stride by sorting a set of
+        # random positions — this clusters some frames and spreads others,
+        # simulating variable frame rate without dropping or adding frames.
+        if torch.rand(1).item() < speed_prob and n_valid >= 4:
+            # Sample n_valid positions in [0, n_valid) and sort them to get
+            # a monotone but non-uniform index sequence.
+            rand_pos = torch.randint(0, n_valid, (n_valid,), device=frame_cls.device)
+            rand_pos, _ = rand_pos.sort()
+            out[b, valid] = out[b, valid[rand_pos]]
+
+    return out
 
 
 class TemporalTransformer(nn.Module):
@@ -58,6 +180,10 @@ class VideoViT(nn.Module):
 
     Frame logits come directly from frame_model.ViT. Video logits are produced
     by passing only each frame's CLS token through temporal transformers.
+
+    During training, temporal_augment() is applied to each head's CLS token
+    sequence in embedding space, after the frozen backbone and before the
+    temporal transformer. At eval time the augmentation is bypassed.
     """
 
     EMBED_DIM = ViT.EMBED_DIM
@@ -98,6 +224,7 @@ class VideoViT(nn.Module):
         frames = video.reshape(B * T, C, H, W)
 
         frame_logits_list, frame_feats_list, cls_list = self.frame_model(frames)
+
         if lengths is None:
             key_padding_mask = None
         else:
@@ -107,6 +234,11 @@ class VideoViT(nn.Module):
         video_feats_list = []
         for temporal_tfm, cls_tokens in zip(self.temporal_transformers, cls_list):
             frame_cls = cls_tokens.reshape(B, T, self.EMBED_DIM)
+
+            # Augment in embedding space during training only.
+            if self.training:
+                frame_cls = temporal_augment(frame_cls, key_padding_mask)
+
             video_feats_list.append(temporal_tfm(frame_cls, key_padding_mask))
 
         video_vec = torch.cat(video_feats_list, dim=1)
