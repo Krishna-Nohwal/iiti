@@ -25,7 +25,7 @@ parser.add_argument('--epochs',        default=50,   type=int)
 parser.add_argument('--batch_size',    default=6,    type=int,
                     help='Videos per batch. Training batches are class-balanced, '
                          'so this must be an even number.')
-parser.add_argument('--num_frames',    default=12,   type=int,
+parser.add_argument('--num_frames',    default=18,   type=int,
                     help='Frames to sample per video. Must match VideoViT.num_frames.')
 parser.add_argument('--num_workers',   default=6,    type=int,
                     help='6 workers suits Ryzen 7000; tune down if RAM is tight')
@@ -39,7 +39,7 @@ parser.add_argument('--root_dir',      default='E:/Work/sampled_30k/', type=str)
 parser.add_argument('--cdf_root',      default='E:/Work/cdfv1_onct_out', type=str)
 parser.add_argument('--cdf_csv',       default='E:/Work/cdfv1_onct_out/manifest_cdfv1_onct.csv', type=str)
 parser.add_argument('--val_ratio',     default=0.2, type=float)
-parser.add_argument('--frame_loss_weight', default=1.0, type=float,
+parser.add_argument('--frame_loss_weight', default=3.0, type=float,
                     help='Weight for frame-level CE+SupCon terms.')
 parser.add_argument('--supcon_weight', default=1/16, type=float)
 parser.add_argument('--no_compile',    action='store_true',
@@ -57,9 +57,8 @@ device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 _num_workers = args.num_workers
 
 # cuDNN benchmark: profile conv algorithms once, then use the fastest.
-# Fixed input size (B×3×266×266) means the profile stays valid all run.
+# Fixed input size (B×3×256×256) means the profile stays valid all run.
 torch.backends.cudnn.benchmark = True
-
 
 
 # ---------------------------------------------------------------------------
@@ -255,7 +254,7 @@ class ManifestVideoDataset(Dataset):
         if n >= T:
             indices = np.linspace(0, n - 1, T, dtype=int)
         else:
-            indices = np.arange(n)
+            indices = np.tile(np.arange(n), math.ceil(T / n))[:T]
         return [paths[i] for i in indices]
 
     def __len__(self):
@@ -355,7 +354,7 @@ class CDFv1VideoDataset(Dataset):
         if n >= T:
             indices = np.linspace(0, n - 1, T, dtype=int)
         else:
-            indices = np.arange(n)
+            indices = np.tile(np.arange(n), math.ceil(T / n))[:T]
         return [paths[i] for i in indices]
 
     def __len__(self):
@@ -372,61 +371,12 @@ class CDFv1VideoDataset(Dataset):
 # Loss
 # ---------------------------------------------------------------------------
 
-bce_loss     = nn.CrossEntropyLoss()               # mean reduction (kept for legacy)
-bce_loss_sum = nn.CrossEntropyLoss(reduction='sum') # sum reduction for per-frame loss
+bce_loss_sum = nn.CrossEntropyLoss(reduction='sum')
 supcon_loss  = SupConLoss()
-
-def _legacy_video_loss(video_logits, frame_logits_list, labels, lengths, frame_weight=1.0):
-    """
-    Primary loss  : CE + SupCon on video-level logits/features.
-    Auxiliary loss: mean CE across all 4 MACHead layers' frame logits.
-                    Frame labels = video label broadcast to all T frames.
-                    SupCon is skipped for frame aux (frame features are not
-                    video-aligned enough to make a good embedding space).
-
-    Args:
-        video_logits      : (B, 2)
-        video_feats       : (B, 192)   — from TemporalTransformer layer 3
-        frame_logits_list : list of 4 × (B*T, 2)
-        labels            : (B,)       — video-level
-        lam               : supcon weight
-    """
-    l_video = bce_loss(video_logits, labels)
-
-    # Broadcast video label to all T frames: (B,) → (B*T,)
-    T = frame_logits_list[0].size(0) // labels.size(0)
-    frame_labels = labels.repeat_interleave(T)   # (B*T,)
-    time_idx = torch.arange(T, device=labels.device).unsqueeze(0)
-    valid_mask = time_idx < lengths.to(labels.device).unsqueeze(1)
-    valid_mask = valid_mask.reshape(-1)
-
-    l_frame = sum(
-        bce_loss(fl[valid_mask], frame_labels[valid_mask]) for fl in frame_logits_list
-    ) / len(frame_logits_list)
-
-    return l_video + frame_weight * l_frame
 
 
 def video_frame_loss(video_logits, frame_logits_list, frame_feats_list,
-                     labels, lengths, frame_weight=1.0, lam=1/16):
-    """
-    Per-frame loss, normalised by total valid frames in the batch.
-
-    For every valid frame f in video v, the per-frame loss is:
-        BCE(video_logits[v])                           <- video signal on every frame
-      + BCE(MACHead[layer_3][f])                       <- last layer, weight 1
-      + (1/3) * BCE(MACHead[layer_i][f]) i in [0,1,2] <- early layers, weight 1/3
-      + lam * SupCon(layer_i features)   i in [0,1,2,3]
-
-    All CE terms use reduction='sum'; the whole thing is divided by n_valid
-    at the end so the final scalar is a per-frame mean, keeping loss magnitude
-    stable across different batch sizes / video lengths.
-
-    SupConLoss from pytorch_metric_learning uses its own internal reduction;
-    it is added as-is and also divided by n_valid for consistency.
-
-    frame_logits_list / frame_feats_list: list of 4, index 3 = last layer (ViT layer 23).
-    """
+                     video_feats_list, labels, lengths, frame_weight=1.0, lam=1/16):
     B = labels.size(0)
     T = frame_logits_list[0].size(0) // B
     frame_labels = labels.repeat_interleave(T)   # (B*T,)
@@ -435,9 +385,7 @@ def video_frame_loss(video_logits, frame_logits_list, frame_feats_list,
     valid_mask = (time_idx < lengths.to(labels.device).unsqueeze(1)).reshape(-1)  # (B*T,)
     n_valid    = valid_mask.sum().clamp_min(1)
 
-    # -- Video loss broadcast to every valid frame ----------------------------
-    # repeat_interleave so video v's logit aligns with all T frames of v.
-    # bce_loss_sum gives one contribution per frame -> sums to T * video_BCE per video.
+    # -- Video BCE broadcast to every valid frame ----------------------------
     video_logits_per_frame = video_logits.repeat_interleave(T, dim=0)  # (B*T, 2)
     l_video = bce_loss_sum(video_logits_per_frame[valid_mask], frame_labels[valid_mask])
 
@@ -448,38 +396,52 @@ def video_frame_loss(video_logits, frame_logits_list, frame_feats_list,
         for i in range(3)
     )
 
-    # -- SupCon on all 4 layers independently --------------------------------
-    l_supcon = lam * sum(
+    # -- SupCon on frame features (all 4 layers) -----------------------------
+    # SupConLoss uses its own internal reduction so we don't divide by n_valid,
+    # just keep it consistent with previous behaviour.
+    l_supcon_frame = lam * sum(
         supcon_loss(frame_feats_list[i][valid_mask], frame_labels[valid_mask])
         for i in range(4)
     )
 
-    total = (l_video/n_valid) + frame_weight * (l_bce_last + l_bce_early + l_supcon)
-    return total 
+    # -- SupCon on video features (all 4 temporal transformers) --------------
+    # B vectors, already internally reduced by SupConLoss.
+    l_supcon_video = lam * sum(
+        supcon_loss(video_feats_list[i], labels)
+        for i in range(4)
+    )
+
+    total = (
+        (l_video + frame_weight * (l_bce_last + l_bce_early)) / n_valid
+        + l_supcon_frame
+        + l_supcon_video
+    )
+    return total
 
 
 def frame_and_video_predictions(video_logits, frame_logits_list, labels, lengths):
     B = labels.size(0)
     T = frame_logits_list[0].size(0) // B
+
+    time_idx       = torch.arange(T, device=labels.device).unsqueeze(0)
+    valid_by_video = time_idx < lengths.to(labels.device).unsqueeze(1)  # (B, T)
+    valid_mask     = valid_by_video.reshape(-1)                          # (B*T,)
+
     frame_labels = labels.repeat_interleave(T)
 
-    time_idx = torch.arange(T, device=labels.device).unsqueeze(0)
-    valid_by_video = time_idx < lengths.to(labels.device).unsqueeze(1)
-    valid_mask = valid_by_video.reshape(-1)
-
-    # MACHead contribution: average of 4 layers
+    # MACHead contribution: average of 4 layers → (B*T,)
     mean_frame_logits = torch.stack(frame_logits_list, dim=0).mean(dim=0)
-    mac_probs = torch.softmax(mean_frame_logits.float(), dim=1)[:, 1]  # (B*T,)
+    mac_probs = torch.softmax(mean_frame_logits.float(), dim=1)[:, 1]
 
-    # Video logit contribution: broadcast each video's prob to its T frames
-    video_probs_per_frame = torch.softmax(video_logits.float(), dim=1)[:, 1]  # (B,)
-    video_probs_per_frame = video_probs_per_frame.repeat_interleave(T)         # (B*T,)
+    # Video logit contribution: broadcast to frames → (B*T,)
+    video_probs_per_frame = torch.softmax(video_logits.float(), dim=1)[:, 1]
+    video_probs_per_frame = video_probs_per_frame.repeat_interleave(T)
 
-    # Frame prob = weighted average (MACHead 5x stronger than video logit)
-    frame_probs_all = (5 * mac_probs + video_probs_per_frame) / 6  # (B*T,)
-    frame_probs = frame_probs_all[valid_mask]
+    # Frame prob: MACHead weighted 5x over video logit
+    frame_probs_all = (5 * mac_probs + video_probs_per_frame) / 6   # (B*T,)
+    frame_probs     = frame_probs_all[valid_mask]
 
-    # Video prob = mean of its valid frame probs
+    # Video prob: mean of valid frame probs
     frame_probs_2d = frame_probs_all.reshape(B, T)
     video_probs = (
         (frame_probs_2d * valid_by_video.float()).sum(dim=1)
@@ -504,15 +466,12 @@ def run_eval(model, loader, desc, device):
     model.eval()
     with torch.inference_mode(), torch.autocast(device_type=device.type, dtype=torch.float16):
         for frames, labels, lengths in tqdm(loader, desc=desc, leave=False):
-            frames = frames.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
+            frames  = frames.to(device, non_blocking=True)
+            labels  = labels.to(device, non_blocking=True)
             lengths = lengths.to(device, non_blocking=True)
             video_logits, frame_logits_list, _, _ = model(frames, lengths)
             frame_labels, frame_probs, video_labels, video_probs = frame_and_video_predictions(
-                video_logits,
-                frame_logits_list,
-                labels,
-                lengths,
+                video_logits, frame_logits_list, labels, lengths,
             )
             frame_probs_all.extend(frame_probs.cpu().numpy().tolist())
             frame_labels_all.extend(frame_labels.cpu().numpy().tolist())
@@ -568,8 +527,6 @@ if __name__ == "__main__":
     model = VideoViT(num_frames=NUM_FRAMES).to(device)
 
     if args.image_ckpt:
-        # Warm-start ViT backbone + MACHeads from pretrained image model.
-        # TemporalTransformers and video_classifier initialise from scratch.
         missing, unexpected = model.load_image_weights(args.image_ckpt, strict=False)
         print(f"  Warm-started from image checkpoint: {args.image_ckpt}")
 
@@ -627,18 +584,17 @@ if __name__ == "__main__":
         for batch_idx, (frames, labels, lengths) in enumerate(
             tqdm(train_loader, desc=f"Epoch {epoch+1} [train]", leave=False)
         ):
-            # frames : (B, T, 3, H, W)
-            frames = frames.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
+            frames  = frames.to(device, non_blocking=True)
+            labels  = labels.to(device, non_blocking=True)
             lengths = lengths.to(device, non_blocking=True)
-            # Note: augmentation is already applied in the Dataset worker.
 
             with torch.autocast(device_type=device.type, dtype=torch.float16):
-                video_logits, frame_logits_list, frame_feats_list, _ = model(frames, lengths)
+                video_logits, frame_logits_list, frame_feats_list, video_feats_list = model(frames, lengths)
                 loss = video_frame_loss(
                     video_logits,
                     frame_logits_list,
                     frame_feats_list,
+                    video_feats_list,
                     labels,
                     lengths,
                     frame_loss_weight,
@@ -655,10 +611,7 @@ if __name__ == "__main__":
 
             with torch.inference_mode():
                 frame_labels, frame_probs, video_labels, video_probs = frame_and_video_predictions(
-                    video_logits,
-                    frame_logits_list,
-                    labels,
-                    lengths,
+                    video_logits, frame_logits_list, labels, lengths,
                 )
             train_frame_probs.extend(frame_probs.cpu().numpy().tolist())
             train_frame_labels.extend(frame_labels.cpu().numpy().tolist())
