@@ -179,7 +179,11 @@ class VideoViT(nn.Module):
     Frame + video model.
 
     Frame logits come directly from frame_model.ViT. Video logits are produced
-    by passing only each frame's CLS token through temporal transformers.
+    by fusing two signals:
+      - temporal_vec  : concat of NUM_HEADS temporal transformer outputs  (NUM_HEADS * EMBED_DIM)
+      - frame_mean_logits : mean of deepest MACHead logits over valid frames  (2)
+
+    These are concatenated and passed through fusion_classifier -> (B, 2).
 
     During training, temporal_augment() is applied to each head's CLS token
     sequence in embedding space, after the frozen backbone and before the
@@ -211,7 +215,8 @@ class VideoViT(nn.Module):
                 for _ in range(self.NUM_HEADS)
             ]
         )
-        self.video_classifier = nn.Linear(self.NUM_HEADS * self.EMBED_DIM, 2)
+        # Input: temporal_vec (NUM_HEADS * EMBED_DIM) + frame_mean_logits (2)
+        self.fusion_classifier = nn.Linear(self.NUM_HEADS * self.EMBED_DIM + 2, 2)
 
     @property
     def vit(self):
@@ -227,9 +232,21 @@ class VideoViT(nn.Module):
 
         if lengths is None:
             key_padding_mask = None
+            valid_counts = torch.full((B,), T, dtype=torch.float32, device=video.device)
         else:
             time_idx = torch.arange(T, device=video.device).unsqueeze(0)
             key_padding_mask = time_idx >= lengths.to(video.device).unsqueeze(1)
+            valid_counts = lengths.to(video.device).float()
+
+        # frame_mean_logits: mean of deepest MACHead logits over valid frames.
+        # frame_logits_list[3] shape: (B*T, 2) — reshape to (B, T, 2),
+        # zero out padding positions, sum, divide by valid count.
+        frame_logits_bt = frame_logits_list[3].reshape(B, T, 2).float()  # (B, T, 2)
+        if key_padding_mask is not None:
+            # key_padding_mask: True = padding; zero those out before summing.
+            valid_mask = (~key_padding_mask).float().unsqueeze(-1)        # (B, T, 1)
+            frame_logits_bt = frame_logits_bt * valid_mask
+        frame_mean_logits = frame_logits_bt.sum(dim=1) / valid_counts.unsqueeze(1).clamp(min=1)  # (B, 2)
 
         video_feats_list = []
         for temporal_tfm, cls_tokens in zip(self.temporal_transformers, cls_list):
@@ -241,8 +258,10 @@ class VideoViT(nn.Module):
 
             video_feats_list.append(temporal_tfm(frame_cls, key_padding_mask))
 
-        video_vec = torch.cat(video_feats_list, dim=1)
-        video_logits = self.video_classifier(video_vec)
+        temporal_vec = torch.cat(video_feats_list, dim=1)                # (B, NUM_HEADS * EMBED_DIM)
+        fused        = torch.cat([temporal_vec, frame_mean_logits], dim=1)  # (B, NUM_HEADS * EMBED_DIM + 2)
+        video_logits = self.fusion_classifier(fused)                      # (B, 2)
+
         return video_logits, frame_logits_list, frame_feats_list, video_feats_list
 
     def load_image_weights(self, image_ckpt_path: str, strict: bool = False):
@@ -253,7 +272,7 @@ class VideoViT(nn.Module):
         for key, value in state.items():
             if key.startswith("frame_model."):
                 frame_state[key[len("frame_model."):]] = value
-            elif not key.startswith(("temporal_transformers.", "video_classifier.")):
+            elif not key.startswith(("temporal_transformers.", "fusion_classifier.")):
                 frame_state[key] = value
 
         missing, unexpected = self.frame_model.load_state_dict(frame_state, strict=strict)

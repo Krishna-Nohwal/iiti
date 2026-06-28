@@ -420,8 +420,8 @@ def stage2_loss(
     Video-level loss only. frame_model is frozen so frame terms produce no
     gradient and are omitted for efficiency.
 
-    video_logits    : (B, 2)
-    video_feats_list: list of NUM_HEADS × (B, EMBED_DIM) — one per temporal head
+    video_logits    : (B, 2)  — output of fusion_classifier
+    video_feats_list: list of NUM_HEADS x (B, EMBED_DIM) — one per temporal head
     labels          : (B,)
     """
     l_bce    = _bce_loss(video_logits, labels)
@@ -440,48 +440,62 @@ def _video_probs_from_forward(
     lengths: torch.Tensor,
 ):
     """
-    Compute per-frame and per-video probabilities from a single forward pass.
+    Compute three sets of predictions from a single forward pass.
 
-    Frame probability: mean of the 4 MACHead softmax outputs (frozen backbone).
-    Video probability: softmax of video_logits from the temporal head.
+    (A) Frame-level       — per-frame fake probability from deepest MACHead
+                            (logits_list[3]), identical to Stage 1 predictions.
+                            Labels are per-frame (video label broadcast to frames).
+
+    (B) Video-mean        — per-video fake probability obtained by averaging
+                            valid frame probs from (A) up to video level.
+                            Apples-to-apples comparison with (C).
+
+    (C) Video-temporal    — per-video fake probability from the temporal
+                            transformer -> video_classifier path.
 
     Returns
     -------
-    frame_labels : (N_valid_frames,)  int64
-    frame_probs  : (N_valid_frames,)  float32
-    video_labels : (B,)               int64
-    video_probs  : (B,)               float32
+    frame_labels     : (N_valid_frames,)  per-frame labels (0/1)
+    frame_probs      : (N_valid_frames,)  per-frame probs  (A)
+    video_labels     : (B,)              per-video labels  (0/1)
+    video_mean_probs : (B,)              per-video probs   (B)
+    video_temp_probs : (B,)              per-video probs   (C)
     """
     B = labels.size(0)
     T = frame_logits_list[0].size(0) // B
 
-    # Valid-frame mask: shape (B, T) then flattened to (B*T,)
-    time_idx    = torch.arange(T, device=labels.device).unsqueeze(0)   # (1, T)
-    valid_2d    = time_idx < lengths.to(labels.device).unsqueeze(1)    # (B, T)
-    valid_flat  = valid_2d.reshape(-1)                                  # (B*T,)
+    # Valid-frame mask
+    time_idx   = torch.arange(T, device=labels.device).unsqueeze(0)    # (1, T)
+    valid_2d   = time_idx < lengths.to(labels.device).unsqueeze(1)     # (B, T)
+    valid_flat = valid_2d.reshape(-1)                                   # (B*T,)
 
-    # Per-frame labels: broadcast video label to every frame, then mask.
-    frame_labels_all = labels.repeat_interleave(T)         # (B*T,)
-    frame_labels     = frame_labels_all[valid_flat]        # (N_valid,)
+    # (A) Frame-level: deepest MACHead only, matching Stage 1 exactly.
+    frame_probs_all  = torch.softmax(frame_logits_list[3].float(), dim=1)[:, 1]  # (B*T,)
+    frame_labels_all = labels.repeat_interleave(T)                                # (B*T,)
+    frame_probs      = frame_probs_all[valid_flat]    # (N_valid,)
+    frame_labels     = frame_labels_all[valid_flat]   # (N_valid,)
 
-    # Frame probs: average across the 4 MACHead layers.
-    mean_frame_logits = torch.stack(frame_logits_list, dim=0).mean(dim=0)  # (B*T, 2)
-    frame_probs_all   = torch.softmax(mean_frame_logits.float(), dim=1)[:, 1]  # (B*T,)
-    frame_probs       = frame_probs_all[valid_flat]        # (N_valid,)
+    # (B) Video-mean: mean of valid frame probs per video.
+    # Reshape to (B, T), zero out padding, sum over T, divide by valid count.
+    frame_probs_2d   = frame_probs_all.reshape(B, T)               # (B, T)
+    valid_counts     = lengths.to(labels.device).float()           # (B,)
+    masked_sum       = (frame_probs_2d * valid_2d.float()).sum(dim=1)  # (B,)
+    video_mean_probs = masked_sum / valid_counts.clamp(min=1)      # (B,)
 
-    # Video probs: directly from the temporal head.
-    video_probs = torch.softmax(video_logits.float(), dim=1)[:, 1]        # (B,)
+    # (C) Video-temporal: temporal transformer -> video_classifier.
+    video_temp_probs = torch.softmax(video_logits.float(), dim=1)[:, 1]  # (B,)
 
-    return frame_labels, frame_probs, labels, video_probs
+    return frame_labels, frame_probs, labels, video_mean_probs, video_temp_probs
 
 
 def run_eval(model: nn.Module, loader: DataLoader, desc: str):
     """
     Evaluate VideoViT on one DataLoader.
-    Returns (frame_labels, frame_probs, video_labels, video_probs).
+    Returns (frame_labels, frame_probs, video_labels, video_mean_probs, video_temp_probs).
     """
-    frame_labels_all, frame_probs_all = [], []
-    video_labels_all, video_probs_all = [], []
+    frame_labels_all, frame_probs_all         = [], []
+    video_labels_all                          = []
+    video_mean_probs_all, video_temp_probs_all = [], []
 
     model.eval()
     with torch.inference_mode(), \
@@ -493,15 +507,19 @@ def run_eval(model: nn.Module, loader: DataLoader, desc: str):
 
             video_logits, frame_logits_list, _, _ = model(frames, lengths)
 
-            fl, fp, vl, vp = _video_probs_from_forward(
+            fl, fp, vl, vmp, vtp = _video_probs_from_forward(
                 video_logits, frame_logits_list, labels, lengths
             )
             frame_labels_all.extend(fl.cpu().numpy().tolist())
             frame_probs_all.extend(fp.cpu().numpy().tolist())
             video_labels_all.extend(vl.cpu().numpy().tolist())
-            video_probs_all.extend(vp.cpu().numpy().tolist())
+            video_mean_probs_all.extend(vmp.cpu().numpy().tolist())
+            video_temp_probs_all.extend(vtp.cpu().numpy().tolist())
 
-    return frame_labels_all, frame_probs_all, video_labels_all, video_probs_all
+    return (
+        frame_labels_all, frame_probs_all,
+        video_labels_all, video_mean_probs_all, video_temp_probs_all,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -594,7 +612,7 @@ if __name__ == "__main__":
     print(
         f"\n  frame_model:            FROZEN\n"
         f"  temporal_transformers:  TRAINABLE\n"
-        f"  video_classifier:       TRAINABLE\n"
+        f"  fusion_classifier:      TRAINABLE\n"
         f"  Trainable params: {trainable_n:,} / {total_n:,} "
         f"({100*trainable_n/total_n:.1f}%)\n"
     )
@@ -650,8 +668,9 @@ if __name__ == "__main__":
         raw_for_eval.frame_model.eval()
 
         iter_i = epoch * iter_per_epoch
-        train_frame_labels, train_frame_probs = [], []
-        train_video_labels, train_video_probs = [], []
+        train_frame_labels, train_frame_probs   = [], []
+        train_video_labels                      = []
+        train_video_mean_probs, train_video_temp_probs = [], []
 
         for batch_idx, (frames, labels, lengths) in enumerate(
             tqdm(train_loader, desc=f"Epoch {epoch+1} [train]", leave=False)
@@ -674,33 +693,37 @@ if __name__ == "__main__":
             scheduler.step(iter_i + batch_idx)
 
             with torch.inference_mode():
-                fl, fp, vl, vp = _video_probs_from_forward(
+                fl, fp, vl, vmp, vtp = _video_probs_from_forward(
                     video_logits, frame_logits_list, labels, lengths
                 )
             train_frame_labels.extend(fl.cpu().numpy().tolist())
             train_frame_probs.extend(fp.cpu().numpy().tolist())
             train_video_labels.extend(vl.cpu().numpy().tolist())
-            train_video_probs.extend(vp.cpu().numpy().tolist())
+            train_video_mean_probs.extend(vmp.cpu().numpy().tolist())
+            train_video_temp_probs.extend(vtp.cpu().numpy().tolist())
 
             if batch_idx % 256 == 0:
                 print(f"  batch={batch_idx:4d}/{iter_per_epoch}  loss={loss.item():.4f}")
 
         # ── Per-epoch metrics ────────────────────────────────────────────────
         print()
-        compute_metrics(train_frame_labels, train_frame_probs, "Train frame", epoch)
-        compute_metrics(train_video_labels, train_video_probs, "Train video", epoch)
+        compute_metrics(train_frame_labels, train_frame_probs,    "Train (A) frame    ", epoch)
+        compute_metrics(train_video_labels, train_video_mean_probs, "Train (B) vid-mean ", epoch)
+        compute_metrics(train_video_labels, train_video_temp_probs, "Train (C) vid-temp ", epoch)
 
-        val_fl, val_fp, val_vl, val_vp = run_eval(
+        val_fl, val_fp, val_vl, val_vmp, val_vtp = run_eval(
             model, val_loader, f"Epoch {epoch+1} [val]"
         )
-        compute_metrics(val_fl, val_fp, "Val frame  ", epoch)
-        compute_metrics(val_vl, val_vp, "Val video  ", epoch)
+        compute_metrics(val_fl,  val_fp,  "Val   (A) frame    ", epoch)
+        compute_metrics(val_vl,  val_vmp, "Val   (B) vid-mean ", epoch)
+        compute_metrics(val_vl,  val_vtp, "Val   (C) vid-temp ", epoch)
 
-        cdf_fl, cdf_fp, cdf_vl, cdf_vp = run_eval(
+        cdf_fl, cdf_fp, cdf_vl, cdf_vmp, cdf_vtp = run_eval(
             model, cdf_loader, f"Epoch {epoch+1} [CDFv1]"
         )
-        compute_metrics(cdf_fl, cdf_fp, "Test frame ", epoch)
-        test_auc = compute_metrics(cdf_vl, cdf_vp, "Test video ", epoch)
+        compute_metrics(cdf_fl,  cdf_fp,  "Test  (A) frame    ", epoch)
+        compute_metrics(cdf_vl,  cdf_vmp, "Test  (B) vid-mean ", epoch)
+        test_auc = compute_metrics(cdf_vl, cdf_vtp, "Test  (C) vid-temp ", epoch)
 
         # ── Checkpointing ────────────────────────────────────────────────────
         # Save the full VideoViT state dict (frozen + trainable) so Stage 2
