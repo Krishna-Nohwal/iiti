@@ -115,8 +115,8 @@ class ViT(nn.Module):
     """
     DINOv3 ViT-Large/16 with 4 register tokens, finetuned with LoRA.
 
-    Forward pass taps intermediate outputs from layers [20, 21, 22, 23].
-    Each layer feeds its own SpatialHead → 4 sets of (logits, 512-dim features).
+    Forward pass taps intermediate outputs from layers [19, 20, 21, 22, 23].
+    Each layer feeds its own SpatialHead → 5 sets of (logits, 512-dim features).
 
     Architecture differences vs ViT-Base:
         - embed_dim 1024 (vs 768)
@@ -134,13 +134,13 @@ class ViT(nn.Module):
         reg_tok       : (B, 4,   1024)
 
     Returns:
-        logits_list   : list of 4 × (B, 2)    — one per tapped layer
-        features_list : list of 4 × (B, 512)  — one per tapped layer
+        logits_list   : list of 5 × (B, 2)    — one per tapped layer
+        features_list : list of 5 × (B, 512)  — one per tapped layer
     """
     EMBED_DIM  = 1024   # ViT-Large hidden size
     NUM_REG    = 4
-    NUM_LAYERS = 4      # number of tapped layers → one SpatialHead each
-    LAYERS     = [20, 21, 22, 23]   # ViT-Large has 24 blocks (0-indexed)
+    NUM_LAYERS = 5      # number of tapped layers → one SpatialHead each
+    LAYERS     = [19, 20, 21, 22, 23]   # ViT-Large has 24 blocks (0-indexed)
     DROP_PATH  = 0.10
     HEAD_DROP  = 0.4
 

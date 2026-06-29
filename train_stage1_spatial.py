@@ -2,9 +2,9 @@
 train_stage1.py — Stage 1 training script.
 
 model() returns (logits_list, features_list, cls_list):
-  - logits_list   : 4 × (B, 2)    one per tapped layer [20,21,22,23]
-  - features_list : 4 × (B, 512)  512-dim bottleneck per SpatialHead
-  - cls_list      : 4 × (B, 1024) CLS tokens, discarded here
+  - logits_list   : 5 × (B, 2)    one per tapped layer [19,20,21,22,23]
+  - features_list : 5 × (B, 512)  512-dim bottleneck per SpatialHead
+  - cls_list      : 5 × (B, 1024) CLS tokens, discarded here
 
 Run this first, then pass best.pth to train_stage2.py.
 """
@@ -227,7 +227,7 @@ def run_eval(model, loader, desc, device):
         for imgs, labels in tqdm(loader, desc=desc, leave=False):
             imgs = imgs.to(device, non_blocking=True)
             logits_list, _, _ = model(imgs)   # discard features_list, cls_list
-            probs = torch.softmax(logits_list[3].float(), dim=1)[:, 1].cpu().numpy()
+            probs = torch.softmax(logits_list[4].float(), dim=1)[:, 1].cpu().numpy()
             all_probs.extend(probs.tolist())
             all_labels.extend(labels.numpy().tolist())
     return all_labels, all_probs
@@ -330,11 +330,12 @@ if __name__ == "__main__":
             with torch.autocast(device_type=device.type, dtype=torch.float16):
                 logits_list, features_list, _ = model(imgs)   # discard cls_list
 
-                l_primary = cls_loss(logits_list[3], features_list[3], labels, lam_supcon, lam_ms)
+                l_primary = cls_loss(logits_list[4], features_list[4], labels, lam_supcon, lam_ms)
                 l_aux     = (
                     cls_loss(logits_list[0], features_list[0], labels, lam_supcon, lam_ms) +
                     cls_loss(logits_list[1], features_list[1], labels, lam_supcon, lam_ms) +
-                    cls_loss(logits_list[2], features_list[2], labels, lam_supcon, lam_ms)
+                    cls_loss(logits_list[2], features_list[2], labels, lam_supcon, lam_ms) +
+                    cls_loss(logits_list[3], features_list[3], labels, lam_supcon, lam_ms)
                 ) / 4.0
                 loss = l_primary + l_aux
 
@@ -347,7 +348,7 @@ if __name__ == "__main__":
             scheduler.step(iter_i + batch_idx)
 
             with torch.inference_mode():
-                probs = torch.softmax(logits_list[3].float(), dim=1)[:, 1].cpu().numpy()
+                probs = torch.softmax(logits_list[4].float(), dim=1)[:, 1].cpu().numpy()
             train_probs.extend(probs.tolist())
             train_labels.extend(labels.cpu().numpy().tolist())
 
