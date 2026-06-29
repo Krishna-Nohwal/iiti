@@ -16,7 +16,7 @@ from tqdm import tqdm
 from pathlib import Path
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from pytorch_metric_learning.losses import SupConLoss
+from pytorch_metric_learning.losses import SupConLoss, MultiSimilarityLoss
 from torch import nn
 from augmentations import augment_batch, load_and_resize, normalize
 from sklearn.metrics import (
@@ -43,6 +43,8 @@ parser.add_argument('--cdf_root',      default='E:/Work/cdfv1_onct_out', type=st
 parser.add_argument('--cdf_csv',       default='E:/Work/cdfv1_onct_out/manifest_cdfv1_onct.csv', type=str)
 parser.add_argument('--val_ratio',     default=0.05, type=float)
 parser.add_argument('--supcon_weight', default=1/16, type=float)
+parser.add_argument('--ms_weight',     default=1/16, type=float,
+                    help='Weight for MultiSimilarityLoss (same scale as supcon_weight)')
 parser.add_argument('--no_compile',    action='store_true',
                     help='Disable torch.compile (useful for debugging)')
 args = parser.parse_args()
@@ -203,9 +205,15 @@ class CDFv1Dataset(Dataset):
 
 bce_loss    = nn.CrossEntropyLoss()
 supcon_loss = SupConLoss()
+ms_loss     = MultiSimilarityLoss()
 
-def cls_loss(logits, features, labels, lam):
-    return bce_loss(logits, labels) + lam * supcon_loss(features, labels)
+def cls_loss(logits, features, labels, lam_supcon, lam_ms):
+    features_norm = torch.nn.functional.normalize(features, dim=1)  # L2-norm for MS
+    return (
+        bce_loss(logits, labels)
+        + lam_supcon * supcon_loss(features, labels)
+        + lam_ms     * ms_loss(features_norm, labels)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -295,7 +303,8 @@ if __name__ == "__main__":
         optimizer, lr_lambda=lambda step: lr_dict[step]
     )
 
-    lam = args.supcon_weight
+    lam_supcon = args.supcon_weight
+    lam_ms     = args.ms_weight
 
     # ── Training loop ───────────────────────────────────────────────────────
     best_test_auc = 0.0
@@ -321,11 +330,11 @@ if __name__ == "__main__":
             with torch.autocast(device_type=device.type, dtype=torch.float16):
                 logits_list, features_list, _ = model(imgs)   # discard cls_list
 
-                l_primary = cls_loss(logits_list[3], features_list[3], labels, lam)
+                l_primary = cls_loss(logits_list[3], features_list[3], labels, lam_supcon, lam_ms)
                 l_aux     = (
-                    cls_loss(logits_list[0], features_list[0], labels, lam) +
-                    cls_loss(logits_list[1], features_list[1], labels, lam) +
-                    cls_loss(logits_list[2], features_list[2], labels, lam)
+                    cls_loss(logits_list[0], features_list[0], labels, lam_supcon, lam_ms) +
+                    cls_loss(logits_list[1], features_list[1], labels, lam_supcon, lam_ms) +
+                    cls_loss(logits_list[2], features_list[2], labels, lam_supcon, lam_ms)
                 ) / 4.0
                 loss = l_primary + l_aux
 
