@@ -41,41 +41,49 @@ class SpatialHead(nn.Module):
     Takes CLS token, REG tokens, and patch tokens from one transformer layer
     and produces logits + a 512-dim intermediate feature vector.
 
-    Both REG and patch tokens are attention-pooled to (B, C) before
-    concatenation, so all three spatial granularities contribute equally:
+    Two-stage fusion:
 
-        [f_cls | f_reg | f_patch]  →  (B, 3C) = (B, 3072)
+      Stage 1 — fuse local spatial signals:
+        f_reg   : (B, C)  ─┐
+                            ├─ cat → (B, 2C) → spatial_mlp → spatial_fused : (B, C)
+        f_patch : (B, C)  ─┘
 
-        f_cls   — global spatial summary
-        f_reg   — artifact-localized spatial outliers
-        f_patch — local spatial features
+      Stage 2 — combine with global CLS and classify:
+        f_cls         : (B, C)  ─┐
+                                  ├─ cat → (B, 2C) → head → (B, C//2) → classifier → logits : (B, 2)
+        spatial_fused : (B, C)  ─┘
 
-    Previously REG was flattened to (B, 4C), dominating 4/6 of the input.
-    Now each component is (B, C), contributing 1/3 each.
+        f_cls   — global spatial summary (CLS token)
+        f_reg   — artifact-localized spatial outliers (attention-pooled)
+        f_patch — local spatial features (attention-pooled)
 
     Params added per head:
-        patch_pool.query : C     =  1,024
-        reg_pool.query   : C     =  1,024
-        Total            :       ~  2,048  (essentially free)
+        patch_pool.query  : C        =  1,024
+        reg_pool.query    : C        =  1,024
+        spatial_mlp       : 2C → C  ~  2,098,176
+        head              : 2C → C//2
 
-    Input dim:  3 * embed_dim  =  3 * 1024  =  3072
-    Hidden dim: embed_dim      =  1024
-    Bottle dim: embed_dim // 2 =  512        ← returned as `features`
-    Output dim: 2  (real / fake logits)
+    spatial_mlp input  : 2 * embed_dim  =  2048  →  C      (spatial_fused)
+    head input         : 2 * embed_dim  =  2048  →  C//2   (features)
+    logits             : 2  (real / fake)
     """
     def __init__(self, embed_dim: int = 1024, num_reg: int = 4, dropout_p: float = 0.4):
         super().__init__()
         self.num_reg    = num_reg
-        in_dim          = 3 * embed_dim   # 3C = 3072  (cls + reg_pooled + patch_pooled)
 
         self.patch_pool = AttentionPool(embed_dim)   # 256 patch tokens → (B, C)
         self.reg_pool   = AttentionPool(embed_dim)   # 4   reg   tokens → (B, C)
 
-        self.head = nn.Sequential(
-            nn.Linear(in_dim, embed_dim),
+        # Stage 1: fuse f_reg + f_patch  →  spatial_fused : (B, C)
+        self.spatial_mlp = nn.Sequential(
+            nn.Linear(2 * embed_dim, embed_dim),
             nn.ReLU(inplace=True),
             nn.Dropout(p=dropout_p),
-            nn.Linear(embed_dim, embed_dim // 2),
+        )
+
+        # Stage 2: project [f_cls | spatial_fused] → (B, C//2) then classify
+        self.head = nn.Sequential(
+            nn.Linear(2 * embed_dim, embed_dim // 2),
             nn.ReLU(inplace=True),
             nn.Dropout(p=dropout_p),
         )
@@ -89,25 +97,34 @@ class SpatialHead(nn.Module):
             patch_tok : (B, H*W,     embed_dim)
         Returns:
             dict with keys:
-                f_cls    : (B, C)
-                f_reg    : (B, C)   attention-pooled (was flattened 4C before)
-                f_patch  : (B, C)   attention-pooled
-                logits   : (B, 2)
-                features : (B, C//2 = 512)
+                f_cls          : (B, C)
+                f_reg          : (B, C)    attention-pooled
+                f_patch        : (B, C)    attention-pooled
+                spatial_fused  : (B, C)    MLP(f_reg ∥ f_patch)
+                logits         : (B, 2)
+                features       : (B, C//2 = 512)
         """
         f_cls   = cls_tok.squeeze(1)          # (B, C)
         f_reg   = self.reg_pool(reg_tok)       # (B, C)  — 4 tokens → 1
         f_patch = self.patch_pool(patch_tok)   # (B, C)  — 256 tokens → 1
 
-        inp = torch.cat([f_cls, f_reg, f_patch], dim=1).float()  # (B, 3C)
-        h   = self.head(inp)                                       # (B, C/2)
+        # Stage 1: fuse local spatial signals
+        spatial_fused = self.spatial_mlp(
+            torch.cat([f_reg, f_patch], dim=1).float()   # (B, 2C)
+        )                                                  # (B, C)
+
+        # Stage 2: combine with CLS and classify
+        h = self.head(
+            torch.cat([f_cls.float(), spatial_fused], dim=1)  # (B, 2C)
+        )                                                       # (B, C//2)
 
         return {
-            "f_cls":    f_cls,
-            "f_reg":    f_reg,
-            "f_patch":  f_patch,
-            "logits":   self.classifier(h),
-            "features": h,
+            "f_cls":         f_cls,
+            "f_reg":         f_reg,
+            "f_patch":       f_patch,
+            "spatial_fused": spatial_fused,
+            "logits":        self.classifier(h),
+            "features":      h,
         }
 
 
@@ -182,6 +199,7 @@ class ViT(nn.Module):
         logits_list:   list = []
         features_list: list = []
         cls_list:      list = []
+        fused_list:    list = []
 
         for i, (spatial_map, prefix_tokens) in enumerate(intermediates):
             B, C, H, W = spatial_map.shape
@@ -193,6 +211,6 @@ class ViT(nn.Module):
             logits_list.append(result["logits"])
             features_list.append(result["features"])
             cls_list.append(result["f_cls"])
+            fused_list.append(result["spatial_fused"])
 
-
-        return logits_list, features_list, cls_list
+        return logits_list, features_list, cls_list, fused_list
